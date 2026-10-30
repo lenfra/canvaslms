@@ -2590,7 +2590,6 @@ if not attachment_cache.restore_cached_attachment(attachment.id, outfile):
   # Download and cache for future use
   attachment.download(outfile)
   attachment_cache.cache_attachment(attachment.id, outfile, {
-    'filename': attachment.filename,
     'size': getattr(attachment, 'size', 0),
     'content_type': getattr(attachment, 'content-type',
                             DEFAULT_CONTENT_TYPE)

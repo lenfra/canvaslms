@@ -64,13 +64,14 @@ The index maps Canvas attachment IDs to cached file metadata:
 {
   "12345": {
     "hash": "a1b2c3...",
-    "filename": "report.pdf",
     "size": 102400,
     "content_type": "application/pdf",
     "last_access": "2025-11-24T10:30:00"
   }
 }
 \end{minted}
+The index deliberately has no filename; see
+\cref{sec:index-without-filenames}.
 
 \subsection{Encrypting cached content}
 
@@ -97,9 +98,9 @@ this is an acceptable price for encryption at rest.
 
 The index stays plaintext JSON: cleanup must read it without a key, and a
 human-readable index is invaluable when debugging cache problems.
-It holds metadata (filenames, sizes), not student work, and it is
-protected by file permissions instead: the cache directory is [[0o700]]
-and the index and content files [[0o600]].
+It holds metadata (hashes, sizes, content types and access times), not
+student work, and it is protected by file permissions instead: the cache
+directory is [[0o700]] and the index and content files [[0o600]].
 
 A [[.dat]] file written by an older, unencrypted canvaslms fails
 decryption.
@@ -201,6 +202,7 @@ def _load_index() -> dict[str, dict[str, Any]]:
 def _save_index(index: dict[str, dict[str, Any]]):
     """Save the metadata index to disk"""
     _ensure_cache_dir()
+    <<drop filenames that older versions stored in [[index]]>>
     with open(INDEX_FILE, 'w') as f:
         json.dump(index, f, indent=2)
     INDEX_FILE.chmod(0o600)
@@ -328,7 +330,6 @@ def test_save_and_load_index(tmp_cache):
     test_index = {
         "12345": {
             "hash": "abc123",
-            "filename": "test.pdf",
             "size": 1024,
             "content_type": "application/pdf",
             "last_access": "2025-11-24T10:30:00"
@@ -461,7 +462,7 @@ def restore_cached_attachment(attachment_id: int,
     _save_index(index)
 
     logger.info(f"Attachment cache hit: {attachment_id} "
-                f"({entry['filename']}, {entry['size'] / 1024:.1f}KB)")
+                f"({entry['size'] / 1024:.1f}KB)")
 
     return True
 @
@@ -492,7 +493,6 @@ def test_restore_handles_missing_file(tmp_cache, tmp_path):
     test_file.write_bytes(b"test content")
 
     metadata = {
-        "filename": "test.txt",
         "size": 100,
         "content_type": "text/plain"
     }
@@ -523,7 +523,6 @@ forever.
 def test_legacy_plaintext_entry_becomes_miss(tmp_cache, test_file, tmp_path):
     """Test that an unencrypted .dat file is discarded as a cache miss"""
     metadata = {
-        "filename": "test.txt",
         "size": 100,
         "content_type": "text/plain"
     }
@@ -574,7 +573,7 @@ def cache_attachment(attachment_id: int, file_path: pathlib.Path,
     Args:
         attachment_id: Canvas attachment ID
         file_path: Path to the downloaded file
-        metadata: Dictionary with 'filename', 'size', 'content_type'
+        metadata: Dictionary with 'size', 'content_type'
     """
     if _fernet is None:
         logger.debug(f"Attachment cache disabled (no encryption key); "
@@ -612,12 +611,65 @@ def cache_attachment(attachment_id: int, file_path: pathlib.Path,
     index = _load_index()
     index[str(attachment_id)] = {
         "hash": file_hash,
-        "filename": metadata.get("filename", "unknown"),
         "size": metadata.get("size", 0),
         "content_type": metadata.get("content_type", "application/octet-stream"),
         "last_access": datetime.now().isoformat()
     }
     _save_index(index)
+@
+
+\subsubsection{Keeping filenames out of the index}
+\label{sec:index-without-filenames}
+
+The index does not store the attachment's filename.
+Students often name their files after themselves, so the filenames are
+personal data, and the index is the one part of the cache that is stored in
+plaintext.
+Nothing in the cache needs the name: restoring and cleanup work on the
+attachment ID and the hash, and the caller already has the name from the
+Canvas attachment object.
+The cache-hit log line identifies the attachment by its ID, which is also
+what Canvas uses.
+
+An index written by an older version may still hold filenames.
+Rather than migrating the index separately, we drop them whenever the index
+is saved.
+Every cache operation that changes the index saves all of it, so the first
+such operation after an upgrade removes the old filenames.
+<<drop filenames that older versions stored in [[index]]>>=
+for entry in index.values():
+    entry.pop("filename", None)
+@
+
+We verify both: new entries hold no filename, and old ones lose it on the
+next save.
+<<test functions>>=
+def test_cache_attachment_stores_no_filename(tmp_cache, test_file):
+    """The index entry for a new attachment holds no filename"""
+    attachment_cache.cache_attachment(1, test_file, {
+        "size": 100,
+        "content_type": "text/plain"
+    })
+
+    entry = attachment_cache._load_index()["1"]
+    assert "filename" not in entry
+    assert entry["size"] == 100
+
+
+def test_save_index_drops_legacy_filenames(tmp_cache):
+    """Filenames from older index entries are removed on save"""
+    attachment_cache._save_index({
+        "1": {
+            "hash": "abc123",
+            "filename": "a_student_lab1.pdf",
+            "size": 100,
+            "content_type": "application/pdf",
+            "last_access": "2025-11-24T10:30:00"
+        }
+    })
+
+    assert "a_student_lab1.pdf" not in attachment_cache.INDEX_FILE.read_text()
+    assert attachment_cache._load_index()["1"]["hash"] == "abc123"
 @
 
 \subsubsection{Testing cache and restore operations}
@@ -631,7 +683,6 @@ def test_cache_and_restore_attachment(tmp_cache, test_file, tmp_path):
     """Test that we can cache and restore an attachment"""
     attachment_id = 12345
     metadata = {
-        "filename": "test.txt",
         "size": test_file.stat().st_size,
         "content_type": "text/plain"
     }
@@ -650,7 +701,6 @@ def test_cache_and_restore_attachment(tmp_cache, test_file, tmp_path):
 def test_cached_file_is_encrypted_and_user_only(tmp_cache, test_file):
     """The on-disk content file must be ciphertext with mode 0600"""
     metadata = {
-        "filename": "test.txt",
         "size": test_file.stat().st_size,
         "content_type": "text/plain"
     }
@@ -666,7 +716,6 @@ def test_cached_file_is_encrypted_and_user_only(tmp_cache, test_file):
 def test_no_key_degrades_to_noop(tmp_cache, test_file, tmp_path):
     """Without a registered key, caching and restoring are no-ops"""
     metadata = {
-        "filename": "test.txt",
         "size": test_file.stat().st_size,
         "content_type": "text/plain"
     }
@@ -696,7 +745,6 @@ def test_deduplication_same_content(tmp_cache, tmp_path):
     file2.write_bytes(content)
     
     metadata = {
-        "filename": "test.txt",
         "size": len(content),
         "content_type": "text/plain"
     }
@@ -803,7 +851,6 @@ def test_cleanup_old_attachments(tmp_cache, tmp_path):
     new_file.write_bytes(b"new content")
     
     metadata = {
-        "filename": "test.txt",
         "size": 100,
         "content_type": "text/plain"
     }
@@ -842,7 +889,6 @@ def test_cleanup_removes_orphaned_files(tmp_cache, tmp_path):
     test_file.write_bytes(b"test content")
     
     metadata = {
-        "filename": "test.txt",
         "size": 100,
         "content_type": "text/plain"
     }
@@ -870,7 +916,6 @@ def test_cleanup_no_old_files(tmp_cache, tmp_path):
     test_file.write_bytes(b"recent content")
     
     metadata = {
-        "filename": "test.txt",
         "size": 100,
         "content_type": "text/plain"
     }
